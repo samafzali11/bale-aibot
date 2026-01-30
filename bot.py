@@ -405,8 +405,9 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages), group=0)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat), group=1)
 
-    webhook_url = f"https://your-leapcell-app.leapcell.dev/{BOT_TOKEN}"
+    webhook_url = f"https://bale-aibot-samafzali114634-o0v3r547.leapcell.dev/{BOT_TOKEN}"
     application.bot.set_webhook(url=webhook_url)
 
     print("Webhook set and server starting...")
+
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
