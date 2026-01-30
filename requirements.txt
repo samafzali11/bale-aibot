@@ -1,0 +1,7 @@
+python-telegram-bot==20.8
+python-dotenv
+flask
+gunicorn
+psycopg2-binary
+openai
+asyncio
