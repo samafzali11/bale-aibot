@@ -3,17 +3,16 @@ import logging
 import os
 from dotenv import load_dotenv
 from telebot import TeleBot, types
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.apihelper import ApiTelegramException
 from flask import Flask, request, abort
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI, OpenAIError, APIError, APITimeoutError
-import asyncio
 import time
+import requests  # برای override api_url
 
 load_dotenv()
 
-# تنظیمات از .env یا پنل Leapcell
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPPORT_ID = int(os.getenv("SUPPORT_ID", "1596192209"))
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@aibotchannel")
@@ -23,7 +22,29 @@ HF_API_KEY = os.getenv("HF_API_KEY")
 if not BOT_TOKEN or not DATABASE_URL:
     raise ValueError("BOT_TOKEN یا DATABASE_URL تعریف نشده")
 
-bot = TeleBot(BOT_TOKEN, threaded=False)
+# تنظیم telebot برای بله (مهم!)
+bot = TeleBot(BOT_TOKEN)
+
+# override api_url برای بله
+def bale_api_url(method):
+    return f"https://tapi.bale.ai/bot{BOT_TOKEN}/{method}"
+
+# جایگزین bot.method با درخواست دستی
+def bale_request(method, **kwargs):
+    url = bale_api_url(method)
+    try:
+        response = requests.post(url, json=kwargs, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Bale API error: {e}")
+        raise
+
+# override برخی متدهای مهم
+bot.get_chat_member = lambda chat_id, user_id: bale_request("getChatMember", chat_id=chat_id, user_id=user_id)
+bot.send_message = lambda chat_id, text, **kwargs: bale_request("sendMessage", chat_id=chat_id, text=text, **kwargs)
+bot.edit_message_text = lambda text, chat_id, message_id, **kwargs: bale_request("editMessageText", chat_id=chat_id, message_id=message_id, text=text, **kwargs)
+bot.forward_message = lambda chat_id, from_chat_id, message_id: bale_request("forwardMessage", chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
 
 app = Flask(__name__)
 
@@ -40,11 +61,10 @@ SYSTEM_PROMPT = """
 هر موضوعی بود با مهربونی کامل جواب بده.
 """
 
-# اتصال به PostgreSQL
+# دیتابیس و توابع ترجمه و ذخیره کاربر (همان قبلی)
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# ایجاد جدول
 def init_db():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -61,7 +81,6 @@ def init_db():
 
 init_db()
 
-# ذخیره یا بروزرسانی کاربر
 def save_or_update_user(user_id, username=None, first_name=None, last_name=None, language=None):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -75,7 +94,6 @@ def save_or_update_user(user_id, username=None, first_name=None, last_name=None,
                 cur.execute('UPDATE users SET language = %s WHERE user_id = %s', (language, user_id))
         conn.commit()
 
-# گرفتن زبان کاربر
 def get_user_language(user_id):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -89,7 +107,7 @@ def translate(user_id, fa, en):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-user_states = {}  # user_id → {"state": "support"|"chatbot", "messages": [...]}
+user_states = {}
 
 # ────────────────────────────────────────────────
 # شروع ربات
@@ -115,7 +133,7 @@ def start(message):
     bot.send_message(message.chat.id, "لطفاً زبان خود را انتخاب کنید / Please choose your language:", reply_markup=markup)
 
 
-# چک عضویت
+# چک عضویت اجباری
 def check_membership(message):
     user_id = message.from_user.id
     try:
@@ -127,7 +145,7 @@ def check_membership(message):
         logger.error(f"خطا چک عضویت: {e}")
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("کانال هوش مصنوعی", url=f"https://t.me/aibotchannel"))
+    markup.add(types.InlineKeyboardButton("کانال هوش مصنوعی", url="https://ble.ir/aibotchannel"))
     markup.add(types.InlineKeyboardButton(translate(user_id, "ثبت و بررسی عضویت", "Check Membership"), callback_data="check_join"))
 
     bot.send_message(message.chat.id, translate(user_id,
@@ -166,8 +184,10 @@ def callback_handler(call):
 
     elif data == "change_lang":
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("فارسی", callback_data="lang_fa"),
-                   types.InlineKeyboardButton("English", callback_data="lang_en"))
+        markup.add(
+            types.InlineKeyboardButton("فارسی", callback_data="lang_fa"),
+            types.InlineKeyboardButton("English", callback_data="lang_en")
+        )
         bot.edit_message_text(translate(user_id, "زبان جدید را انتخاب کنید:", "Choose new language:"),
                               call.message.chat.id, call.message.message_id, reply_markup=markup)
 
@@ -226,20 +246,20 @@ def callback_handler(call):
         show_main_menu(call.message)
 
 
-# جمع‌آوری پیام‌ها برای پشتیبانی
+# جمع‌آوری پیام‌ها (پشتیبانی و چت‌بات)
 @bot.message_handler(func=lambda m: True)
-def collect_messages(message):
+def handle_messages(message):
     user_id = message.from_user.id
     state = user_states.get(user_id, {}).get("state")
 
-    if state in ["support", "reply"]:
+    if state == "support":
         if "messages" not in user_states[user_id]:
             user_states[user_id]["messages"] = []
         user_states[user_id]["messages"].append(message)
         bot.reply_to(message, translate(user_id, "دریافت شد ✅", "Received ✅"))
-        return True
+        return
 
-    if state == "chatbot":
+    elif state == "chatbot":
         user_message = message.text.strip()
         if not user_message:
             return
@@ -257,7 +277,8 @@ def collect_messages(message):
                 top_p=0.9
             )
 
-            if time.time() - start_time > 45:
+            elapsed = time.time() - start_time
+            if elapsed > 45:
                 bot.reply_to(message, translate(user_id,
                                                 "متأسفم، پاسخ هوش مصنوعی بیش از ۴۵ ثانیه طول کشید 😔\nبعداً امتحان کن.",
                                                 "Sorry, AI took longer than 45 seconds 😔\nTry later."))
@@ -277,8 +298,9 @@ def collect_messages(message):
                                             "متأسفانه مشکلی در ارتباط با هوش مصنوعی پیش آمد 😅\nبعداً امتحان کن.",
                                             "Problem connecting to AI 😅\nTry later."))
 
-    # اگر هیچ حالتی نبود، نادیده بگیر یا پیام بده
-    # bot.reply_to(message, "از منوی اصلی استفاده کن یا /start بزن 😊")
+    else:
+        # اگر هیچ حالتی نبود، به منو هدایت کن
+        bot.reply_to(message, "از منوی اصلی استفاده کن یا /start بزن 😊")
 
 
 # webhook برای Flask
