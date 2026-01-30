@@ -4,4 +4,4 @@ flask
 gunicorn
 psycopg2-binary
 openai
-asyncio
+uvicorn
