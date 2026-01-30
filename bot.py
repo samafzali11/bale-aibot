@@ -399,14 +399,17 @@ if __name__ == "__main__":
         .job_queue(None) \
         .build()
 
+    # handlerها
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages), group=0)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat), group=1)
 
+    # تنظیم webhook
     webhook_url = f"https://bale-aibot-samafzali114634-o0v3r547.leapcell.dev/{BOT_TOKEN}"
-    loop = asyncio.get_event_loop()
     try:
+        import asyncio
+        loop = asyncio.get_event_loop()
         loop.run_until_complete(application.bot.set_webhook(url=webhook_url))
         print(f"Webhook با موفقیت ست شد: {webhook_url}")
     except Exception as e:
