@@ -1,34 +1,31 @@
+# bot.py
 import logging
 import os
-import asyncio
 from dotenv import load_dotenv
+from telebot import TeleBot, types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request, abort
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.error import BadRequest
-from openai import OpenAI, OpenAIError, APIError, APITimeoutError
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from openai import OpenAI, OpenAIError, APIError, APITimeoutError
+import asyncio
+import time
 
 load_dotenv()
 
+# تنظیمات از .env یا پنل Leapcell
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPPORT_ID = int(os.getenv("SUPPORT_ID"))
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+SUPPORT_ID = int(os.getenv("SUPPORT_ID", "1596192209"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@aibotchannel")
 DATABASE_URL = os.getenv("DATABASE_URL")
 HF_API_KEY = os.getenv("HF_API_KEY")
 
-BASE_URL = "https://tapi.bale.ai/bot"
-
 if not BOT_TOKEN or not DATABASE_URL:
-    raise ValueError("BOT_TOKEN یا DATABASE_URL در .env تعریف نشده است")
+    raise ValueError("BOT_TOKEN یا DATABASE_URL تعریف نشده")
+
+bot = TeleBot(BOT_TOKEN, threaded=False)
+
+app = Flask(__name__)
 
 HF_CLIENT = OpenAI(
     base_url="https://router.huggingface.co/v1",
@@ -43,9 +40,11 @@ SYSTEM_PROMPT = """
 هر موضوعی بود با مهربونی کامل جواب بده.
 """
 
+# اتصال به PostgreSQL
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+# ایجاد جدول
 def init_db():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -62,6 +61,7 @@ def init_db():
 
 init_db()
 
+# ذخیره یا بروزرسانی کاربر
 def save_or_update_user(user_id, username=None, first_name=None, last_name=None, language=None):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -75,6 +75,7 @@ def save_or_update_user(user_id, username=None, first_name=None, last_name=None,
                 cur.execute('UPDATE users SET language = %s WHERE user_id = %s', (language, user_id))
         conn.commit()
 
+# گرفتن زبان کاربر
 def get_user_language(user_id):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -82,258 +83,169 @@ def get_user_language(user_id):
             result = cur.fetchone()
             return result['language'] if result else 'fa'
 
-def translate(user_id, fa_text, en_text):
-    lang = get_user_language(user_id)
-    return fa_text if lang == 'fa' else en_text
+def translate(user_id, fa, en):
+    return fa if get_user_language(user_id) == 'fa' else en
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-user_states = {}
+user_states = {}  # user_id → {"state": "support"|"chatbot", "messages": [...]}
 
-app = Flask(__name__)
+# ────────────────────────────────────────────────
+# شروع ربات
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-
-    save_or_update_user(
-        user_id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name
-    )
+    save_or_update_user(user_id, username, first_name, last_name)
 
     if get_user_language(user_id) in ['fa', 'en']:
-        await check_membership(update, context)
+        check_membership(message)
         return
 
-    text = translate(user_id,
-                     "لطفاً زبان خود را انتخاب کنید:",
-                     "Please choose your language:")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("فارسی", callback_data="lang_fa"),
+        types.InlineKeyboardButton("English", callback_data="lang_en")
+    )
 
-    keyboard = [
-        [InlineKeyboardButton("فارسی", callback_data="lang_fa"),
-         InlineKeyboardButton("English", callback_data="lang_en")]
-    ]
-
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    bot.send_message(message.chat.id, "لطفاً زبان خود را انتخاب کنید / Please choose your language:", reply_markup=markup)
 
 
-async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query if update.callback_query else None
-    user_id = update.effective_user.id if not query else query.from_user.id
-
+# چک عضویت
+def check_membership(message):
+    user_id = message.from_user.id
     try:
-        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        member = bot.get_chat_member(CHANNEL_ID, user_id)
         if member.status in ["member", "administrator", "creator"]:
-            await show_main_menu(update, context)
+            show_main_menu(message)
             return
     except Exception as e:
         logger.error(f"خطا چک عضویت: {e}")
 
-    text = translate(user_id,
-                     "لطفاً برای استفاده از ربات در کانال زیر عضو شوید:",
-                     "Please join the channel below to use the bot:")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("کانال هوش مصنوعی", url=f"https://t.me/aibotchannel"))
+    markup.add(types.InlineKeyboardButton(translate(user_id, "ثبت و بررسی عضویت", "Check Membership"), callback_data="check_join"))
 
-    keyboard = [
-        [InlineKeyboardButton("کانال هوش مصنوعی", url=f"https://t.me/aibotchannel")],
-        [InlineKeyboardButton(translate(user_id, "ثبت و بررسی عضویت", "Check Membership"), callback_data="check_join")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    try:
-        if query:
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-    except BadRequest:
-        if query:
-            await query.message.reply_text(text, reply_markup=reply_markup)
+    bot.send_message(message.chat.id, translate(user_id,
+                                                "لطفاً برای استفاده از ربات در کانال زیر عضو شوید:",
+                                                "Please join the channel below to use the bot:"), reply_markup=markup)
 
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query if update.callback_query else None
-    user_id = update.effective_user.id if not query else query.from_user.id
+# منوی اصلی
+def show_main_menu(message):
+    user_id = message.from_user.id
 
-    text = translate(user_id,
-                     "سلام! 👋\nبه ربات هوشمند خوش آمدید!\nهر سؤالی داری، بگو تا کمکت کنم 🚀",
-                     "Hi! 👋\nWelcome to the smart bot!\nAsk anything, I'm here to help 🚀")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(translate(user_id, "چت‌بات", "Chat Bot"), callback_data="chatbot"))
+    markup.add(types.InlineKeyboardButton(translate(user_id, "پشتیبانی", "Support"), callback_data="support_open"))
+    markup.add(types.InlineKeyboardButton(translate(user_id, "درباره ربات", "About Bot"), callback_data="about_bot"))
+    markup.add(types.InlineKeyboardButton(translate(user_id, "تغییر زبان", "Change Language"), callback_data="change_lang"))
 
-    keyboard = [
-        [InlineKeyboardButton(translate(user_id, "چت‌بات", "Chat Bot"), callback_data="chatbot")],
-        [InlineKeyboardButton(translate(user_id, "پشتیبانی", "Support"), callback_data="support_open")],
-        [InlineKeyboardButton(translate(user_id, "درباره ربات", "About Bot"), callback_data="about_bot")],
-        [InlineKeyboardButton(translate(user_id, "تغییر زبان", "Change Language"), callback_data="change_lang")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    try:
-        if query:
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-    except BadRequest:
-        if query:
-            await query.message.reply_text(text, reply_markup=reply_markup)
+    bot.send_message(message.chat.id, translate(user_id,
+                                                "سلام! 👋\nبه ربات هوشمند خوش آمدید!\nهر سؤالی داری، بگو تا کمکت کنم 🚀",
+                                                "Hi! 👋\nWelcome to the smart bot!\nAsk anything, I'm here to help 🚀"), reply_markup=markup)
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except BadRequest:
-        pass
+# مدیریت callbackها
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
 
-    user_id = query.from_user.id
-    data = query.data
+    if data in ["lang_fa", "lang_en"]:
+        lang = "fa" if data == "lang_fa" else "en"
+        save_or_update_user(user_id, language=lang)
+        check_membership(call.message)
 
-    try:
-        if data in ["lang_fa", "lang_en"]:
-            lang = "fa" if data == "lang_fa" else "en"
-            save_or_update_user(user_id, language=lang)
-            await check_membership(update, context)
+    elif data == "check_join":
+        check_membership(call.message)
 
-        elif data == "change_lang":
-            text = translate(user_id, "زبان جدید را انتخاب کنید:", "Choose new language:")
-            keyboard = [
-                [InlineKeyboardButton("فارسی", callback_data="lang_fa"),
-                 InlineKeyboardButton("English", callback_data="lang_en")]
-            ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "change_lang":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("فارسی", callback_data="lang_fa"),
+                   types.InlineKeyboardButton("English", callback_data="lang_en"))
+        bot.edit_message_text(translate(user_id, "زبان جدید را انتخاب کنید:", "Choose new language:"),
+                              call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-        elif data == "check_join":
-            await check_membership(update, context)
+    elif data == "about_bot":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(translate(user_id, "بازگشت", "Back"), callback_data="main_menu"))
+        bot.edit_message_text(translate(user_id,
+                                        "🤖 این ربات با هوش مصنوعی واقعی کار می‌کنه و می‌تونه به هر سؤالی جواب بده.\nبا لحن دوستانه و صمیمی باهات حرف می‌زنه 😊",
+                                        "🤖 This bot uses real AI and can answer any question.\nFriendly and warm tone 😊"),
+                              call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-        elif data == "about_bot":
-            text = translate(user_id,
-                             "🤖 این ربات با هوش مصنوعی واقعی کار می‌کنه و می‌تونه به هر سؤالی جواب بده.\nبا لحن دوستانه و صمیمی باهات حرف می‌زنه 😊",
-                             "🤖 This bot uses real AI and can answer any question.\nFriendly and warm tone 😊")
-            keyboard = [[InlineKeyboardButton(translate(user_id, "بازگشت", "Back"), callback_data="main_menu")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "main_menu":
+        show_main_menu(call.message)
 
-        elif data == "main_menu":
-            await show_main_menu(update, context)
+    elif data == "support_open":
+        user_states[user_id] = {"state": "support", "messages": []}
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(translate(user_id, "ارسال به پشتیبانی", "Send to Support"), callback_data="send_support"))
+        markup.add(types.InlineKeyboardButton(translate(user_id, "برگشت به منو", "Back to Menu"), callback_data="main_menu"))
+        bot.edit_message_text(translate(user_id,
+                                        "هر چی می‌خوای به پشتیبانی بفرستی همین‌جا بفرست.\nوقتی تموم شد دکمه زیر رو بزن:",
+                                        "Send anything to support here.\nWhen done click below:"),
+                              call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-        elif data == "support_open":
-            user_states[user_id] = {"state": "support", "messages": []}
-            text = translate(user_id,
-                             "هر چی می‌خوای به پشتیبانی بفرستی همین‌جا بفرست.\nوقتی تموم شد دکمه زیر رو بزن:",
-                             "Send anything to support here.\nWhen done click below:")
-            keyboard = [
-                [InlineKeyboardButton(translate(user_id, "ارسال به پشتیبانی", "Send to Support"), callback_data="send_support")],
-                [InlineKeyboardButton(translate(user_id, "برگشت به منو", "Back to Menu"), callback_data="main_menu")]
-            ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "send_support":
+        if user_id not in user_states or not user_states[user_id].get("messages"):
+            bot.edit_message_text(translate(user_id, "هیچ پیامی برای ارسال وجود ندارد!", "No message to send!"),
+                                  call.message.chat.id, call.message.message_id)
+            return
 
-        elif data == "send_support":
-            if user_id not in user_states or not user_states[user_id].get("messages"):
-                await query.edit_message_text(translate(user_id, "هیچ پیامی برای ارسال وجود ندارد!", "No message to send!"))
-                return
+        messages = user_states[user_id]["messages"]
+        del user_states[user_id]
 
-            messages = user_states[user_id]["messages"]
+        header = f"پیام جدید از کاربر {user_id} (@{call.from_user.username or 'ندارد'})"
+
+        bot.send_message(SUPPORT_ID, header)
+        for msg in messages:
+            bot.forward_message(SUPPORT_ID, call.message.chat.id, msg.message_id)
+
+        bot.send_message(SUPPORT_ID, "برای پاسخ مستقیم ریپلای کن.")
+        bot.edit_message_text(translate(user_id, "پیامت با موفقیت ارسال شد ✓", "Message sent ✓"),
+                              call.message.chat.id, call.message.message_id)
+
+    elif data == "chatbot":
+        user_states[user_id] = {"state": "chatbot"}
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(translate(user_id, "خروج از چت‌بات", "Exit Chatbot"), callback_data="exit_chatbot"))
+        bot.edit_message_text(translate(user_id,
+                                        "الان می‌تونی هر سؤالی داری تایپ کنی، هوش مصنوعی جواب می‌ده 😊\nبرای خروج:",
+                                        "Ask anything now, AI will answer 😊\nTo exit:"),
+                              call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+    elif data == "exit_chatbot":
+        if user_id in user_states:
             del user_states[user_id]
-
-            header = f"پیام جدید از کاربر {user_id} (@{query.from_user.username or 'ندارد'})"
-
-            await context.bot.send_message(SUPPORT_ID, header)
-            for msg in messages:
-                await msg.forward(SUPPORT_ID)
-
-            await context.bot.send_message(
-                SUPPORT_ID,
-                "برای پاسخ مستقیم ریپلای کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("ارسال پاسخ", callback_data=f"reply_support_{user_id}")]
-                ])
-            )
-
-            await query.edit_message_text(
-                translate(user_id, "پیامت با موفقیت ارسال شد ✓", "Message sent ✓")
-            )
-
-        elif data.startswith("reply_support_"):
-            target_user_id = int(data.split("_")[-1])
-            user_states[SUPPORT_ID] = {"state": "reply", "target_user": target_user_id, "messages": []}
-            text = translate(SUPPORT_ID,
-                             f"در حال پاسخ به کاربر {target_user_id}\nپیام خود را به پیام کاربر ریپلای کنید:",
-                             f"Replying to user {target_user_id}\nWrite your message:")
-            keyboard = [[InlineKeyboardButton(translate(SUPPORT_ID, "ارسال پاسخ", "Send Reply"), callback_data=f"send_reply_{target_user_id}")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-        elif data.startswith("send_reply_"):
-            target_user_id = int(data.split("_")[-1])
-            if SUPPORT_ID not in user_states or not user_states[SUPPORT_ID].get("messages"):
-                await query.edit_message_text("هیچ پاسخی برای ارسال وجود ندارد!")
-                return
-
-            messages = user_states[SUPPORT_ID]["messages"]
-            del user_states[SUPPORT_ID]
-
-            for msg in messages:
-                await msg.forward(target_user_id)
-
-            await query.edit_message_text(translate(SUPPORT_ID, "پاسخ ارسال شد.", "Reply sent."))
-            await context.bot.send_message(target_user_id, translate(target_user_id, "پاسخ پشتیبانی دریافت شد ✓", "Support reply received ✓"))
-
-        elif data == "chatbot":
-            user_states[user_id] = {"state": "chatbot"}
-            text = translate(user_id,
-                             "الان می‌تونی هر سؤالی داری تایپ کنی، هوش مصنوعی جواب می‌ده 😊\nبرای خروج:",
-                             "Ask anything now, AI will answer 😊\nTo exit:")
-            keyboard = [[InlineKeyboardButton(translate(user_id, "خروج از چت‌بات", "Exit Chatbot"), callback_data="exit_chatbot")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-        elif data == "exit_chatbot":
-            if user_id in user_states:
-                del user_states[user_id]
-            await show_main_menu(update, context)
-
-    except BadRequest as e:
-        if "query is too old" in str(e).lower():
-            await query.message.reply_text(translate(user_id,
-                                                    "دکمه قدیمی شده، لطفاً دوباره /start بزنید 😅",
-                                                    "Button is old, please /start again 😅"))
-        else:
-            logger.error(f"BadRequest: {e}")
-    except Exception as e:
-        logger.error(f"Error in button_handler: {e}")
-        await query.message.reply_text(translate(user_id,
-                                                "یه مشکلی پیش اومد... دوباره امتحان کن 😅",
-                                                "Something went wrong... Try again 😅"))
+        show_main_menu(call.message)
 
 
-async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# جمع‌آوری پیام‌ها برای پشتیبانی
+@bot.message_handler(func=lambda m: True)
+def collect_messages(message):
+    user_id = message.from_user.id
     state = user_states.get(user_id, {}).get("state")
 
     if state in ["support", "reply"]:
-        messages = user_states[user_id].get("messages", [])
-        if update.message.message_id not in [m.message_id for m in messages]:
-            user_states[user_id]["messages"].append(update.message)
-            await update.message.reply_text(translate(user_id, "دریافت شد ✅", "Received ✅"), quote=False)
+        if "messages" not in user_states[user_id]:
+            user_states[user_id]["messages"] = []
+        user_states[user_id]["messages"].append(message)
+        bot.reply_to(message, translate(user_id, "دریافت شد ✅", "Received ✅"))
         return True
-    return False
 
+    if state == "chatbot":
+        user_message = message.text.strip()
+        if not user_message:
+            return
 
-async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if user_states.get(user_id, {}).get("state") != "chatbot":
-        await collect_messages(update, context)
-        return
-
-    user_message = update.message.text.strip()
-    if not user_message:
-        return
-
-    try:
-        async with asyncio.timeout(45):
+        try:
+            start_time = time.time()
             completion = HF_CLIENT.chat.completions.create(
                 model="zai-org/GLM-4.7:novita",
                 messages=[
@@ -345,43 +257,37 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 top_p=0.9
             )
 
-        answer = completion.choices[0].message.content.strip()
+            if time.time() - start_time > 45:
+                bot.reply_to(message, translate(user_id,
+                                                "متأسفم، پاسخ هوش مصنوعی بیش از ۴۵ ثانیه طول کشید 😔\nبعداً امتحان کن.",
+                                                "Sorry, AI took longer than 45 seconds 😔\nTry later."))
+                return
 
-        if len(answer) > 4000:
-            parts = [answer[i:i+4000] for i in range(0, len(answer), 4000)]
-            for part in parts:
-                await update.message.reply_text(part, quote=False)
-        else:
-            await update.message.reply_text(answer, quote=False)
+            answer = completion.choices[0].message.content.strip()
 
-    except asyncio.TimeoutError:
-        await update.message.reply_text(
-            translate(user_id,
-                      "متأسفم، پاسخ هوش مصنوعی بیش از ۴۵ ثانیه طول کشید 😔\nلطفاً بعداً دوباره امتحان کنید.",
-                      "Sorry, AI response took longer than 45 seconds 😔\nPlease try again later.")
-        )
-    except (APIError, APITimeoutError, OpenAIError) as e:
-        logger.error(f"API error: {e}")
-        await update.message.reply_text(
-            translate(user_id,
-                      "متأسفانه مشکلی در ارتباط با هوش مصنوعی پیش آمد 😅\nبعداً دوباره امتحان کن.",
-                      "Unfortunately there was a problem connecting to AI 😅\nTry again later.")
-        )
-    except Exception as e:
-        logger.error(f"General error in ai_chat: {e}")
-        await update.message.reply_text(
-            translate(user_id,
-                      "یه اتفاق غیرمنتظره افتاد... دوباره بگو ببینم چی بود؟ 😅",
-                      "Something unexpected happened... Tell me again? 😅")
-        )
+            if len(answer) > 4000:
+                for i in range(0, len(answer), 4000):
+                    bot.reply_to(message, answer[i:i+4000])
+            else:
+                bot.reply_to(message, answer)
+
+        except Exception as e:
+            logger.error(f"AI error: {e}")
+            bot.reply_to(message, translate(user_id,
+                                            "متأسفانه مشکلی در ارتباط با هوش مصنوعی پیش آمد 😅\nبعداً امتحان کن.",
+                                            "Problem connecting to AI 😅\nTry later."))
+
+    # اگر هیچ حالتی نبود، نادیده بگیر یا پیام بده
+    # bot.reply_to(message, "از منوی اصلی استفاده کن یا /start بزن 😊")
 
 
+# webhook برای Flask
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    if request.headers.get("content-type") == "application/json":
-        json_string = request.get_data().decode("utf-8")
-        update = Update.de_json(json_string, application.bot)
-        application.update_queue.put_nowait(update)
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = types.Update.de_json(json_string)
+        bot.process_new_updates([update])
         return "OK", 200
     abort(403)
 
@@ -392,28 +298,4 @@ def index():
 
 
 if __name__ == "__main__":
-    application = ApplicationBuilder() \
-        .token(BOT_TOKEN) \
-        .base_url(BASE_URL) \
-        .base_file_url("https://tapi.bale.ai/file/bot") \
-        .job_queue(None) \
-        .build()
-
-    # handlerها
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages), group=0)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat), group=1)
-
-    # تنظیم webhook
-    webhook_url = f"https://bale-aibot-samafzali114634-o0v3r547.leapcell.dev/{BOT_TOKEN}"
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(application.bot.set_webhook(url=webhook_url))
-        print(f"Webhook با موفقیت ست شد: {webhook_url}")
-    except Exception as e:
-        print(f"خطا در set_webhook: {e}")
-
-    print("سرور شروع شد...")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
